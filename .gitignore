@@ -1,0 +1,6 @@
+# VIM's files
+*.swp
+mysession.vim
+
+# Build artifacts
+/linux/build
