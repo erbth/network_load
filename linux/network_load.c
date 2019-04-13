@@ -23,11 +23,13 @@
 
 /* Well, yeah, these are purely functional macros now ... */
 #define CMD_TYPE_START_UDP_IP 0
+#define CMD_TYPE_CONNECT_TCP_IP 1
 
 #define CTRL(c) (c & 0x1f)
 
 #define log(f,...) { wprintw (log_win, f, ##__VA_ARGS__); wrefresh (log_win); }
 #define log_perror(s) { wprintw (log_win, "%s: %s\n", s, strerror (errno)); wrefresh (log_win); }
+
 
 /* Structures and other datatypes */
 struct udp_sender {
@@ -40,6 +42,104 @@ struct udp_sender {
 	double data_flow;
 };
 
+struct tcp_connection {
+	struct sockaddr_in saddr;
+	char caddr[32];
+
+	int fd;
+	uint64_t data_in, data_out;
+	double data_flow_in, data_flow_out;
+};
+
+
+/* Global variables */
+/* A list of TCP connections */
+int epoll_fd = -1;
+
+struct tcp_connection *tcp_connections = NULL;
+size_t tcp_connections_cap = 0;
+size_t tcp_connections_len = 0;
+
+
+/* Helper functions */
+int add_tcp_connection (const struct sockaddr_in *saddr, int fd)
+{
+	if (!tcp_connections)
+	{
+		tcp_connections_cap = 2;
+		tcp_connections_len = 0;
+
+		tcp_connections = calloc (tcp_connections_cap, sizeof (*tcp_connections));
+		if (!tcp_connections)
+		{
+			perror ("calloc failed");
+			return -1;
+		}
+	}
+
+	if (tcp_connections_len >= tcp_connections_cap)
+	{
+		struct tcp_connection *newlist = calloc (
+				tcp_connections_cap * 2,
+				sizeof (*tcp_connections));
+
+		if (!newlist)
+		{
+			perror ("calloc failed");
+			return -1;
+		}
+
+		memcpy (newlist, tcp_connections, tcp_connections_len * sizeof (*tcp_connections));
+
+		struct tcp_connection *oldlist = tcp_connections;
+
+		tcp_connections = newlist;
+		tcp_connections_cap *= 2;
+
+		free (oldlist);
+	}
+
+	struct tcp_connection *s = tcp_connections + tcp_connections_len;
+
+	s->saddr = *saddr;
+
+	inet_ntop (AF_INET, saddr, s->caddr, sizeof (s->caddr));
+
+	s->fd = fd;
+	s->data_in = s->data_out = 0;
+	s->data_flow_in = s->data_flow_out = 0.;
+
+
+	struct epoll_event ep_event;
+
+	ep_event.data.u64 = 200000 + tcp_connections_len;
+	ep_event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLHUP;
+	epoll_ctl (epoll_fd, EPOLL_CTL_ADD, s->fd, &ep_event);
+
+	tcp_connections_len++;
+
+	return 0;
+}
+
+void remove_tcp_connection_by_id (int id)
+{
+	if (!tcp_connections || id >= tcp_connections_len)
+		return;
+
+	epoll_ctl (epoll_fd, EPOLL_CTL_DEL, tcp_connections[id].fd, NULL);
+
+	close (tcp_connections[id].fd);
+
+	tcp_connections_len--;
+
+	for (size_t i = id; i < tcp_connections_len; i++)
+	{
+		tcp_connections[id] = tcp_connections[id + 1];
+	}
+}
+
+
+/* The main program */
 int main(int argc, char** argv)
 {
 	int exit_code = EXIT_FAILURE;
@@ -52,7 +152,6 @@ int main(int argc, char** argv)
 	char cmd_buffer[CMD_BUFFER_SIZE];
 	int cmd_buffer_pos;
 
-	int epoll_fd = -1;
 	struct epoll_event ep_event;
 
 	int udp_infd = -1;
@@ -62,9 +161,14 @@ int main(int argc, char** argv)
 		.sin_port = htons (udp_inport),
 		.sin_addr = INADDR_ANY
 	};
-	uint8_t input_buffer[INPUT_BUFFER_SIZE];
 
-	uint8_t output_buffer[OUTPUT_BUFFER_SIZE];
+	int tcp_listenfd = -1;
+	int tcp_listenport = 11112;
+	struct sockaddr_in tcp_listenaddr = {
+		.sin_family = AF_INET,
+		.sin_port = htons (tcp_listenport),
+		.sin_addr = INADDR_ANY
+	};
 
 	/* A list of UDP senders */
 	struct udp_sender *udp_senders = NULL;
@@ -75,6 +179,9 @@ int main(int argc, char** argv)
 	uint64_t udp_data = 0;
 	double udp_data_flow = 0.;
 	struct timespec t1, t2;
+
+	uint8_t input_buffer[INPUT_BUFFER_SIZE];
+	uint8_t output_buffer[OUTPUT_BUFFER_SIZE];
 
 	/* Acquire resources */
 	/* Start curses mode */
@@ -87,7 +194,7 @@ int main(int argc, char** argv)
 
 	/* Create a window for general information, one to display all connections,
 	 * and one to log to. */
-	gen_win_height = 6;
+	gen_win_height = 7;
 	log_win_height = 4;
 	conn_win_height = row - gen_win_height - log_win_height;
 
@@ -106,11 +213,11 @@ int main(int argc, char** argv)
 	keypad (log_win, TRUE);
 
 	/* Write initial content to the windows */
-	wprintw (gen_win, "UDP load generator and bandwith meter");
+	wprintw (gen_win, "Network load generator and data flow meter");
 	mvwprintw (gen_win, 1, 0, "Hit `q' to quit and F1 for help\n");
 	wrefresh (gen_win);
 
-	wprintw (conn_win, "Connections resp. senders:\n");
+	wprintw (conn_win, "TCP connections and UDP senders:\n");
 	whline (conn_win, 0, col);
 	wrefresh (conn_win);
 
@@ -126,14 +233,15 @@ int main(int argc, char** argv)
 		goto END;
 	}
 
-	/* About fds registered with epoll: u64 100000 ist the first udp sender, u64 3
-	 * is the udp input, u64 0 is stdin. */
+	/* About fds registered with epoll: u64 100000 ist the first udp sender,
+	 * u64 200000 is the first tcp connection, u64 3 is the udp input,
+	 * u64 4 is the tcp listener, and u64 0 is stdin. */
 	ep_event.data.u64 = 0;
 	ep_event.events = EPOLLIN;
 	epoll_ctl (epoll_fd, EPOLL_CTL_ADD, 0, &ep_event);
 
 
-	/* Create a socket to listen for incomming data */
+	/* Create a socket to receive incoming udp data */
 	udp_infd = socket (AF_INET, SOCK_DGRAM, 0);
 	if (udp_infd < 0)
 	{
@@ -163,7 +271,7 @@ int main(int argc, char** argv)
 		ep_event.events = EPOLLIN;
 		epoll_ctl (epoll_fd, EPOLL_CTL_ADD, udp_infd, &ep_event);
 
-		wprintw (gen_win, "Incoming traffic is accepted on port %d", (int) udp_inport);
+		wprintw (gen_win, "Incoming traffic is accepted on port %d\n", (int) udp_inport);
 		wrefresh (gen_win);
 	}
 	else
@@ -171,7 +279,56 @@ int main(int argc, char** argv)
 		close (udp_infd);
 		udp_infd = -1;
 
-		wprintw (gen_win, "No incoming traffic is accepted");
+		wprintw (gen_win, "No incoming traffic is accepted\n");
+		wrefresh (gen_win);
+	}
+
+	/* Create a socket to listen for tcp connections */
+	tcp_listenfd = socket (AF_INET, SOCK_STREAM, 0);
+	if (tcp_listenfd < 0)
+	{
+		perror ("Failed to create a tcp socket");
+		goto END;
+	}
+
+	flags = fcntl (tcp_listenfd, F_GETFL, 0);
+	if (flags < 0)
+	{
+		perror ("Failed to get tcp listener fd's flags");
+		goto END;
+	}
+
+	flags |= O_NONBLOCK;
+
+	if (fcntl (tcp_listenfd, F_SETFL, flags) < 0)
+	{
+		perror ("Failed to set the tcp listener's fd to nonblocking mode");
+		goto END;
+	}
+
+	if (bind (tcp_listenfd, (struct sockaddr*) &tcp_listenaddr, sizeof (tcp_listenaddr)) >= 0)
+	{
+		/* Start listening */
+		if (listen (tcp_listenfd, 1000) < 0)
+		{
+			perror ("Failed to start listening on a tcp socket");
+			goto END;
+		}
+
+		/* Add to epoll instance */
+		ep_event.data.u64 = 4;
+		ep_event.events = EPOLLIN;
+		epoll_ctl (epoll_fd, EPOLL_CTL_ADD, tcp_listenfd, &ep_event);
+
+		wprintw (gen_win, "Listening for TCP connections on port %d\n", (int) tcp_listenport);
+		wrefresh (gen_win);
+	}
+	else
+	{
+		close (tcp_listenfd);
+		tcp_listenfd = -1;
+
+		wprintw (gen_win, "Not listening for incoming tcp connections");
 		wrefresh (gen_win);
 	}
 
@@ -339,7 +496,7 @@ int main(int argc, char** argv)
 				redrawwin (log_win);
 				wrefresh (log_win);
 			}
-			else if (c == CTRL('n'))
+			else if (c == CTRL('u'))
 			{
 				cmd_type = CMD_TYPE_START_UDP_IP;
 				cmd_buffer_pos = 0;
@@ -361,8 +518,27 @@ int main(int argc, char** argv)
 
 				wrefresh (cmd_win);
 			}
-			else if (c == CTRL('s'))
+			else if (c == CTRL('t'))
 			{
+				cmd_type = CMD_TYPE_CONNECT_TCP_IP;
+				cmd_buffer_pos = 0;
+
+				cmd_win = newwin (4, col - 2, (row - 4) / 2, 0);
+				if (!cmd_win)
+				{
+					fprintf (stderr, "Failed to create ncurses window\n");
+					exit_code = EXIT_FAILURE;
+					break;
+				}
+
+				box (cmd_win, 0, 0);
+				mvwprintw (cmd_win, 1, 1, "Connect using TCP to IPv4 address:");
+				wmove (cmd_win, 2, 1);
+
+				curs_set (1);
+				wmove (cmd_win, 2, 1);
+
+				wrefresh (cmd_win);
 			}
 			else if (c == 10 || c == KEY_ENTER)
 			{
@@ -444,7 +620,7 @@ int main(int argc, char** argv)
 							int ok = 1;
 
 							s->fd = socket (AF_INET, SOCK_DGRAM, 0);
-							if (!s->fd)
+							if (s->fd < 0)
 								ok = 0;
 
 							if (ok)
@@ -493,6 +669,65 @@ int main(int argc, char** argv)
 							}
 						}
 					}
+					else if (cmd_type == CMD_TYPE_CONNECT_TCP_IP)
+					{
+						struct in_addr addr;
+
+						cmd_buffer[cmd_buffer_pos] = '\0';
+
+						if (inet_aton (cmd_buffer, &addr))
+						{
+							struct sockaddr_in saddr = {
+								.sin_family = AF_INET,
+								.sin_port = htons (tcp_listenport),
+								.sin_addr = addr
+							};
+
+							int ok = 1;
+
+							int fd = socket (AF_INET, SOCK_STREAM, 0);
+							if (fd < 0)
+								ok = 0;
+
+							if (ok)
+							{
+								if (connect (fd, (struct sockaddr *) &(saddr), sizeof (saddr)) < 0)
+								{
+									close (fd);
+									ok = 0;
+								}
+							}
+
+							int flags;
+
+							if (ok)
+							{
+								flags = fcntl (fd, F_GETFL, 0);
+								if (flags < 0)
+								{
+									close (fd);
+									ok = 0;
+								}
+							}
+
+							flags |= O_NONBLOCK;
+
+							if (ok)
+							{
+								if (fcntl (fd, F_SETFL, flags) < 0)
+								{
+									close (fd);
+									ok = 0;
+								}
+							}
+
+							if (ok)
+							{
+								if (add_tcp_connection (&saddr, fd) < 0)
+									close (fd);
+							}
+						}
+					}
 				}
 			}
 			else if (tolower(c) == 'q')
@@ -533,15 +768,16 @@ int main(int argc, char** argv)
 
 				wprintw (help_win, "Help:\n\n");
 				wprintw (help_win,
-"Ctrl+N        Begin sending to a specified host\n"
-"Ctrl+S        Stop sending to a specified host\n\n"
+"Ctrl+U        Begin sending UDP packets to a specified host\n"
+"Ctrl+T        Connect to a specified host using TCP\n\n"
 "If no incoming traffic is accepted, this is most likely because\n"
 "I cannot bind an udp socket to port 11111 on any IPv4 address of the system.\n");
 
 				wprintw (help_win, "\nPress any key to return to main screen ...");
 				wrefresh (help_win);
 			}
-			else if (cmd_win && cmd_type == CMD_TYPE_START_UDP_IP)
+			else if (cmd_win && (cmd_type == CMD_TYPE_START_UDP_IP ||
+						cmd_type == CMD_TYPE_CONNECT_TCP_IP))
 			{
 				if ((c >= '0' && c <= '9') || c == '.')
 				{
@@ -572,7 +808,77 @@ int main(int argc, char** argv)
 					udp_data += ret;
 				}
 			}
-			while (ret > 0);
+			while (ret > INPUT_BUFFER_SIZE / 2);
+		}
+		else if (ep_event.data.u64 == 4)
+		{
+			/* Accept a new connection */
+		}
+		else if (ep_event.data.u64 >= 200000)
+		{
+			struct tcp_connection *c = tcp_connections + (ep_event.data.u64 - 200000);
+
+			int ret;
+
+			if (ep_event.events & (EPOLLHUP | EPOLLRDHUP))
+			{
+				int id = ep_event.data.u64 - 200000;
+
+				log ("Connection %d closed by remote\n", id);
+
+				remove_tcp_connection_by_id (id);
+				c = NULL;
+			}
+
+			if (c && (ep_event.events & EPOLLIN))
+			{
+				do {
+					ret = read (c->fd, input_buffer, INPUT_BUFFER_SIZE);
+
+					if (ret < 0)
+					{
+						if (errno != EWOULDBLOCK && errno != EAGAIN)
+						{
+							int id = ep_event.data.u64 - 200000;
+
+							log ("Removing connection %d since it seems broken\n", id);
+
+							remove_tcp_connection_by_id (id);
+							c = NULL;
+
+							break;
+						}
+					}
+
+					c->data_in += ret;
+				}
+				while (ret > INPUT_BUFFER_SIZE / 2);
+			}
+
+			if (c && (ep_event.events & EPOLLOUT))
+			{
+				do {
+					ret = write (c->fd, output_buffer, OUTPUT_BUFFER_SIZE);
+
+					if (ret < 0)
+					{
+						if (errno != EWOULDBLOCK && errno != EAGAIN)
+						{
+							int id = ep_event.data.u64 - 200000;
+
+							log ("Removing connection %d since it seems broken\n", id);
+
+							remove_tcp_connection_by_id (id);
+							c = NULL;
+
+							break;
+						}
+					}
+
+					c->data_out += ret;
+				}
+				while (ret > OUTPUT_BUFFER_SIZE / 2);
+			}
 		}
 		else if (ep_event.data.u64 >= 100000)
 		{
@@ -580,7 +886,7 @@ int main(int argc, char** argv)
 
 			int ret;
 
-			/* do */ {
+			do {
 				ret = write (s->fd, output_buffer, OUTPUT_BUFFER_SIZE);
 
 				if (ret < 0)
@@ -599,7 +905,7 @@ int main(int argc, char** argv)
 					s->data += ret;
 				}
 			}
-			// while (ret > OUTPUT_BUFFER_SIZE / 2);
+			while (ret > OUTPUT_BUFFER_SIZE / 2);
 		}
 	}
 
@@ -607,6 +913,16 @@ END:
 	/* Cleanup resources */
 	if (epoll_fd >= 0)
 		close (epoll_fd);
+
+	if (tcp_connections)
+	{
+		for (size_t i = 0; i < tcp_connections_len; i++)
+		{
+			close (tcp_connections[i].fd);
+		}
+
+		free (tcp_connections);
+	}
 
 	if (udp_senders)
 	{
@@ -617,6 +933,9 @@ END:
 
 		free (udp_senders);
 	}
+
+	if (tcp_listenfd >= 0)
+		close (tcp_listenfd);
 
 	if (udp_infd >= 0)
 		close (udp_infd);
