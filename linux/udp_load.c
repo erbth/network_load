@@ -203,7 +203,7 @@ int main(int argc, char** argv)
 
 		long delay = t2.tv_nsec - t1.tv_nsec + (t2.tv_sec - t1.tv_sec) * 1000000000;
 
-		if (delay > 90000000)
+		if (delay > 900000000)
 		{
 			/* Print receiver */
 			if (udp_infd >= 0)
@@ -306,7 +306,7 @@ int main(int argc, char** argv)
 		}
 
 		/* Wait until the timeout expires or a fd becomes ready */
-		int ret = epoll_wait (epoll_fd, &ep_event, 1, 100 - delay / 1000000);
+		int ret = epoll_wait (epoll_fd, &ep_event, 1, 1000 - delay / 1000000);
 
 		if (ret < 0)
 		{
