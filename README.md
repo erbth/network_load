@@ -4,4 +4,4 @@ It features a ncurses user interface.
 Feel free to copy, modify, redistribute etc. in any way you like (except if
 harmful to others)!
 
-Thomas Erbesdobler
+Thomas Erbesdobler \<t.erbesdobler@gmx.de\>, 19th Oct. 2019
