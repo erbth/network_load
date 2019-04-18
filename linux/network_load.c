@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <curses.h>
@@ -99,22 +101,22 @@ int add_tcp_connection (const struct sockaddr_in *saddr, int fd)
 		free (oldlist);
 	}
 
-	struct tcp_connection *s = tcp_connections + tcp_connections_len;
+	struct tcp_connection *c = tcp_connections + tcp_connections_len;
 
-	s->saddr = *saddr;
+	c->saddr = *saddr;
 
-	inet_ntop (AF_INET, saddr, s->caddr, sizeof (s->caddr));
+	inet_ntop (AF_INET, &saddr->sin_addr, c->caddr, sizeof (c->caddr));
 
-	s->fd = fd;
-	s->data_in = s->data_out = 0;
-	s->data_flow_in = s->data_flow_out = 0.;
+	c->fd = fd;
+	c->data_in = c->data_out = 0;
+	c->data_flow_in = c->data_flow_out = 0.;
 
 
 	struct epoll_event ep_event;
 
 	ep_event.data.u64 = 200000 + tcp_connections_len;
 	ep_event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLHUP;
-	epoll_ctl (epoll_fd, EPOLL_CTL_ADD, s->fd, &ep_event);
+	epoll_ctl (epoll_fd, EPOLL_CTL_ADD, c->fd, &ep_event);
 
 	tcp_connections_len++;
 
@@ -392,23 +394,28 @@ int main(int argc, char** argv)
 					val = udp_data_flow;
 				}
 
-				mvwprintw (gen_win, 4, 0,
+				wmove (gen_win, 4, 0);
+				wclrtoeol (gen_win);
+
+				wprintw (gen_win,
 						"Current incoming data flow: %.3f %s/s",
 						val,
 						unit);
 			}
 
+			/* Print connections */
+			wclear (conn_win);
+			wprintw (conn_win, "TCP connections and UDP senders:\n");
+			whline (conn_win, 0, col);
+			wmove (conn_win, 2, 0);
+
 			/* Print senders */
 			if (udp_senders && udp_senders_len > 0)
 			{
-				wclear (conn_win);
-
-				wprintw (conn_win, "Connections resp. senders:\n");
-				whline (conn_win, 0, col);
-				wmove (conn_win, 2, 0);
-
 				double val;
 				char *unit;
+
+				wprintw (conn_win, "UDP senders:\n");
 
 				for (size_t i = 0; i < udp_senders_len; i++)
 				{
@@ -441,6 +448,73 @@ int main(int argc, char** argv)
 					wprintw (conn_win, " %-32s   %.3f %s/s\n", s->caddr, val, unit);
 
 					s->data = 0;
+				}
+
+				wprintw (conn_win, "\n");
+			}
+
+			/* Print connections */
+			if (tcp_connections && tcp_connections_len > 0)
+			{
+				double val_in, val_out;
+				char *unit_in, *unit_out;
+
+				wprintw (conn_win, "TCP connections:\n");
+
+				for (size_t i = 0; i < tcp_connections_len; i++)
+				{
+					struct tcp_connection *c = tcp_connections + i;
+
+					c->data_flow_in = (double) c->data_in  / ((double) delay / 1e9) * 8;
+					c->data_flow_out = (double) c->data_out  / ((double) delay / 1e9) * 8;
+
+					/* Format a nice display */
+					if (c->data_flow_in > 1e9)
+					{
+						unit_in = "GBit";
+						val_in = c->data_flow_in / 1e9;
+					}
+					else if (c->data_flow_in > 1e6)
+					{
+						unit_in = "MBit";
+						val_in = c->data_flow_in / 1e6;
+					}
+					else if (c->data_flow_in > 1e3)
+					{
+						unit_in = "kBit";
+						val_in = c->data_flow_in / 1e3;
+					}
+					else
+					{
+						unit_in = "Bit";
+						val_in = c->data_flow_in;
+					}
+
+					if (c->data_flow_out > 1e9)
+					{
+						unit_out = "GBit";
+						val_out = c->data_flow_out / 1e9;
+					}
+					else if (c->data_flow_out > 1e6)
+					{
+						unit_out = "MBit";
+						val_out = c->data_flow_out / 1e6;
+					}
+					else if (c->data_flow_out > 1e3)
+					{
+						unit_out = "kBit";
+						val_out = c->data_flow_out / 1e3;
+					}
+					else
+					{
+						unit_out = "Bit";
+						val_out = c->data_flow_out;
+					}
+
+					wprintw (conn_win, " %-32s   < %.3f %s/s   > %.3f %s/s\n",
+							c->caddr, val_in, unit_in, val_out, unit_out);
+
+					c->data_in = c->data_out = 0;
 				}
 			}
 
@@ -783,12 +857,13 @@ int main(int argc, char** argv)
 				{
 					cmd_buffer[cmd_buffer_pos++] = c;
 					waddch (cmd_win, c);
+					wrefresh (cmd_win);
 				}
 			}
 		}
 		else if (ep_event.data.u64 == 3)
 		{
-			/* Incomming data on the udp socket */
+			/* Incoming data on the udp socket */
 			int ret;
 
 			do {
@@ -813,6 +888,31 @@ int main(int argc, char** argv)
 		else if (ep_event.data.u64 == 4)
 		{
 			/* Accept a new connection */
+			struct sockaddr_in saddr;
+			socklen_t saddr_size = sizeof (saddr);
+
+			int new_fd = accept4 (
+					tcp_listenfd,
+					(struct sockaddr *) &saddr,
+					&saddr_size,
+					SOCK_NONBLOCK);
+
+			if (new_fd < 0)
+			{
+				if (errno != EWOULDBLOCK && errno != EAGAIN)
+				{
+					perror ("failed to accept connection on tcp listener-fd");
+					exit_code = EXIT_FAILURE;
+					break;
+				}
+			}
+
+			if (add_tcp_connection (&saddr, new_fd) < 0)
+			{
+				exit_code = EXIT_FAILURE;
+				close (new_fd);
+				break;
+			}
 		}
 		else if (ep_event.data.u64 >= 200000)
 		{
@@ -886,7 +986,7 @@ int main(int argc, char** argv)
 
 			int ret;
 
-			do {
+			/* do */ {
 				ret = write (s->fd, output_buffer, OUTPUT_BUFFER_SIZE);
 
 				if (ret < 0)
@@ -905,7 +1005,7 @@ int main(int argc, char** argv)
 					s->data += ret;
 				}
 			}
-			while (ret > OUTPUT_BUFFER_SIZE / 2);
+			// while (ret > OUTPUT_BUFFER_SIZE / 2);
 		}
 	}
 
